@@ -169,7 +169,42 @@
       @media (prefers-color-scheme: dark) {
         .btn-mark { background: var(--ink); color: #141518; }
       }
-      .btn-reset { grid-column: 1 / -1; min-height: 44px; padding: 9px 12px; font-weight: 600; color: var(--ink-soft); }
+      .btn-reset { min-height: 44px; padding: 9px 12px; font-weight: 600; color: var(--ink-soft); }
+      .vol-control {
+        min-height: 44px;
+        padding: 7px 12px 9px;
+        border: 1px solid var(--line);
+        border-radius: 11px;
+        background: var(--panel-2);
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: 2px;
+      }
+      .vol-control label {
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.85rem;
+        font-weight: 600;
+        color: var(--ink-soft);
+      }
+      .vol-control label span {
+        font-family: "IBM Plex Mono", ui-monospace, monospace;
+        font-weight: 700;
+        color: var(--ink);
+      }
+      .vol-control input[type="range"] {
+        width: 100%;
+        margin: 0;
+        accent-color: var(--accent);
+        cursor: pointer;
+      }
+      .sound-note {
+        text-align: center;
+        color: var(--ink-soft);
+        font-size: 0.82rem;
+        margin-top: 8px;
+      }
       .keys-hint {
         text-align: center;
         color: var(--ink-soft);
@@ -392,8 +427,13 @@
           <button class="btn-start" id="btnStart" type="button">▶ Start</button>
           <button class="btn-mark" id="btnMark" type="button" disabled>＋ Mark event</button>
           <button class="btn-reset" id="btnReset" type="button">Reset timer &amp; events</button>
+          <div class="vol-control">
+            <label for="volSlider">Volume <span id="volPct">100%</span></label>
+            <input type="range" id="volSlider" min="0" max="100" step="5" value="100" aria-label="Sound volume" />
+          </div>
         </div>
         <div class="keys-hint"><kbd>Space</kbd> start / pause &nbsp;·&nbsp; <kbd>M</kbd> mark event</div>
+        <div class="sound-note">Beeps: a 3·2·1 countdown right before the run starts · driver-switch beeps at 25s and 35s · a long buzz at 60s when time is up. Slide volume to 0 to mute. Drag the slider to hear a test beep at the new level.</div>
 
         <div class="chips" id="chips">
           <span class="chip-label">Quick events — one tap marks it at the current time:</span>
@@ -448,11 +488,76 @@
         var savedRuns = [];        // [{label, dateISO, dateText, events:[{label,t}], totalMs}]
         var rafId = null;
 
+        // ----- Sound cues (WebAudio beeps, no audio files) -----
+        var audioCtx = null;
+        var volume = 1;            // 0..1, from the volume slider (0 = muted)
+        var countingDown = false;
+        var countdownTimer = null;
+        var countdownSteps = [];   // timeouts that flip the big 3·2·1 display
+        var cueFired = { s25: false, s35: false, end: false };
+
+        function ensureAudio() {
+          if (!audioCtx) {
+            var AC = window.AudioContext || window.webkitAudioContext;
+            if (AC) { try { audioCtx = new AC(); } catch (e) { audioCtx = null; } }
+          }
+          if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+          return audioCtx;
+        }
+
+        function tone(freq, durMs, delayMs, peak) {
+          if (volume <= 0) return;
+          var ctx = ensureAudio();
+          if (!ctx) return;
+          var t0 = ctx.currentTime + (delayMs || 0) / 1000;
+          var level = (peak || 0.55) * volume;
+          // Two detuned square-wave oscillators: much more cutting than a sine
+          // beep, so the cues stay audible over a loud robot and a noisy room.
+          [0, 6].forEach(function (detune) {
+            var osc = ctx.createOscillator();
+            var gain = ctx.createGain();
+            osc.type = "square";
+            osc.frequency.value = freq;
+            osc.detune.value = detune;
+            gain.gain.setValueAtTime(0.0001, t0);
+            gain.gain.exponentialRampToValueAtTime(level, t0 + 0.008);
+            gain.gain.setValueAtTime(level, t0 + Math.max(0.009, durMs / 1000 - 0.03));
+            gain.gain.exponentialRampToValueAtTime(0.0001, t0 + durMs / 1000);
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start(t0);
+            osc.stop(t0 + durMs / 1000 + 0.05);
+          });
+        }
+
+        function checkCues(e) {
+          if (!cueFired.s25 && e >= 25000) {
+            cueFired.s25 = true;
+            // Driver-switch window opens: two bright beeps.
+            tone(1047, 150, 0);
+            tone(1047, 150, 240);
+          }
+          if (!cueFired.s35 && e >= 35000) {
+            cueFired.s35 = true;
+            // Switch window closing: three lower beeps — clearly different.
+            tone(784, 150, 0);
+            tone(784, 150, 240);
+            tone(784, 150, 480);
+          }
+          if (!cueFired.end && e >= MATCH_MS) {
+            cueFired.end = true;
+            // Time up: long, loud buzz.
+            tone(523, 950, 0, 0.8);
+          }
+        }
+
         // ----- Elements -----
         var clockEl = document.getElementById("clock");
         var clockSub = document.getElementById("clockSub");
         var matchFill = document.getElementById("matchFill");
         var btnStart = document.getElementById("btnStart");
+        var volSlider = document.getElementById("volSlider");
+        var volPct = document.getElementById("volPct");
         var btnMark = document.getElementById("btnMark");
         var btnReset = document.getElementById("btnReset");
         var btnFinish = document.getElementById("btnFinish");
@@ -508,37 +613,79 @@
         }
         function tick() {
           renderClock();
+          checkCues(elapsed());
           if (running) rafId = requestAnimationFrame(tick);
         }
 
         // ----- Timer controls -----
+        function startTimer() {
+          startStamp = performance.now();
+          running = true;
+          started = true;
+          btnStart.disabled = false;
+          btnStart.textContent = "⏸ Pause";
+          btnStart.classList.remove("paused-state");
+          btnMark.disabled = false;
+          btnFinish.disabled = false;
+          rafId = requestAnimationFrame(tick);
+          renderClock();
+          renderEvents();
+        }
+
+        function beginCountdown() {
+          // Three short beeps with a big 3·2·1 on the clock, then a longer
+          // "go" beep — the clock starts on the go beep.
+          countingDown = true;
+          ensureAudio();
+          btnStart.disabled = true;
+          btnStart.textContent = "Get ready…";
+          clockSub.textContent = "Get ready…";
+          clockEl.textContent = "3";
+          tone(784, 140, 0);
+          tone(784, 140, 350);
+          tone(784, 140, 700);
+          tone(1175, 420, 1050, 0.7);
+          countdownSteps.push(setTimeout(function () { clockEl.textContent = "2"; }, 350));
+          countdownSteps.push(setTimeout(function () { clockEl.textContent = "1"; }, 700));
+          countdownTimer = setTimeout(function () {
+            countingDown = false;
+            countdownTimer = null;
+            countdownSteps = [];
+            startTimer();
+          }, 1050);
+        }
+
         function startPause() {
+          if (countingDown) return;
           if (running) {
             bankedMs = elapsed();
             running = false;
             if (rafId) cancelAnimationFrame(rafId);
             btnStart.textContent = "▶ Resume";
             btnStart.classList.add("paused-state");
+            btnMark.disabled = !started;
+            btnFinish.disabled = !started;
+            renderClock();
+            renderEvents();
+          } else if (!started && volume > 0) {
+            beginCountdown();
           } else {
-            startStamp = performance.now();
-            running = true;
-            started = true;
-            btnStart.textContent = "⏸ Pause";
-            btnStart.classList.remove("paused-state");
-            rafId = requestAnimationFrame(tick);
+            startTimer();
           }
-          btnMark.disabled = !started;
-          btnFinish.disabled = !started;
-          renderClock();
-          renderEvents();
         }
 
         function resetAll() {
+          if (countdownTimer) { clearTimeout(countdownTimer); countdownTimer = null; }
+          countdownSteps.forEach(function (id) { clearTimeout(id); });
+          countdownSteps = [];
+          countingDown = false;
           running = false;
           started = false;
           bankedMs = 0;
           events = [];
+          cueFired = { s25: false, s35: false, end: false };
           if (rafId) cancelAnimationFrame(rafId);
+          btnStart.disabled = false;
           btnStart.textContent = "▶ Start";
           btnStart.classList.remove("paused-state");
           btnMark.disabled = true;
@@ -784,6 +931,15 @@
           b.textContent = label;
           b.addEventListener("click", function () { markEvent(label); });
           chipsWrap.appendChild(b);
+        });
+
+        volSlider.addEventListener("input", function () {
+          volume = volSlider.value / 100;
+          volPct.textContent = volSlider.value + "%";
+        });
+        volSlider.addEventListener("change", function () {
+          // Test beep at the level just chosen, so it can be set by ear.
+          tone(1047, 160, 0);
         });
 
         btnStart.addEventListener("click", startPause);
